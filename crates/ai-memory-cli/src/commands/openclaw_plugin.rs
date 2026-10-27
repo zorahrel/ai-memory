@@ -201,7 +201,14 @@ pub(crate) fn manifest_json() -> String {
         "configSchema": {
             "type": "object",
             "additionalProperties": false,
-            "properties": {}
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["all", "owner-direct"],
+                    "default": "all",
+                    "description": "Which sessions are captured and receive handoffs. `owner-direct` keeps group, channel and third-party DM sessions out of ai-memory."
+                }
+            }
         }
     }))
     .expect("OpenClaw manifest serializes")
@@ -289,6 +296,7 @@ function tomlKey(text: string, key: string): string | undefined {{
 
 {repo_root_project}
 {apply_marker_params}
+{session_scope}
 
 function textFrom(value: unknown): string {{
   if (value === null || value === undefined) return "";
@@ -433,17 +441,22 @@ export default definePluginEntry({{
   name: "ai-memory",
   description: "Capture OpenClaw lifecycle events into ai-memory.",
   register(api) {{
+    configureSessionScope((api as any).pluginConfig, (api as any).config);
+
     api.on("session_start", (event: any, ctx: any) => {{
+      if (!sessionInScope(ctx)) return;
       rememberSession(event, ctx);
     }});
 
     api.on("session_end", async (event: any, ctx: any) => {{
+      if (!sessionInScope(ctx)) return;
       rememberSession(event, ctx);
       postHook("session-end", payload(event, ctx, {{ reason: event?.reason }}));
       await drainHookQueueForDispose();
     }});
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {{
+      if (!sessionInScope(ctx)) return;
       rememberSession(event, ctx);
       postHook("user-prompt", payload(event, ctx, {{
         prompt: textFrom(event?.prompt ?? event?.userPrompt ?? event?.message ?? event?.messages?.at?.(-1)),
@@ -457,6 +470,7 @@ export default definePluginEntry({{
     }});
 
     api.on("before_tool_call", (event: any, ctx: any) => {{
+      if (!sessionInScope(ctx)) return;
       rememberSession(event, ctx);
       postHook("pre-tool-use", payload(event, ctx, {{
         tool: event?.toolName,
@@ -467,6 +481,7 @@ export default definePluginEntry({{
     }});
 
     api.on("after_tool_call", (event: any, ctx: any) => {{
+      if (!sessionInScope(ctx)) return;
       rememberSession(event, ctx);
       postHook("post-tool-use", payload(event, ctx, {{
         tool: event?.toolName,
@@ -480,10 +495,12 @@ export default definePluginEntry({{
     }});
 
     api.on("before_compaction", (event: any, ctx: any) => {{
+      if (!sessionInScope(ctx)) return;
       postPreCompact(event, ctx);
     }});
 
     api.on("agent_end", (event: any, ctx: any) => {{
+      if (!sessionInScope(ctx)) return;
       rememberSession(event, ctx);
       postHook("stop", payload(event, ctx, {{ success: event?.success }}));
     }});
@@ -496,8 +513,51 @@ export default definePluginEntry({{
         timeout_signal = ts_timeout_signal(),
         auth_headers = ts_auth_headers_fn(),
         spool_runtime = ts_spool_runtime(),
+        session_scope = SESSION_SCOPE_TS,
     )
 }
+
+/// Session gate for the `scope` plugin option.
+///
+/// `all` (default) keeps upstream behaviour. `owner-direct` admits only the
+/// owner's private sessions and fails closed on anything it cannot place:
+/// the host-minted `memoryAudience` decides when present (OpenClaw grants
+/// `owner-private` only to direct chats whose sender is the owner), otherwise
+/// the session key does: `<channel>:direct:<peer>` must match
+/// `commands.ownerAllowFrom`, the agent main session and the local operator
+/// surfaces (`dashboard`, `ios-*`) pass, groups, channels, cron and spawned
+/// sessions without an audience are dropped.
+const SESSION_SCOPE_TS: &str = r#"
+let SESSION_SCOPE: "all" | "owner-direct" = "all";
+let SESSION_OWNERS = new Set<string>();
+
+function configureSessionScope(pluginConfig: any, hostConfig: any): void {
+  SESSION_SCOPE = pluginConfig?.scope === "owner-direct" ? "owner-direct" : "all";
+  const owners = hostConfig?.commands?.ownerAllowFrom;
+  SESSION_OWNERS = new Set(
+    (Array.isArray(owners) ? owners : [])
+      .filter((v: unknown) => typeof v === "string")
+      .map((v: string) => v.trim().toLowerCase()),
+  );
+}
+
+function sessionInScope(ctx: any): boolean {
+  if (SESSION_SCOPE === "all") return true;
+  const audience = ctx?.memoryAudience?.kind;
+  if (audience === "owner-private") return true;
+  if (typeof audience === "string") return false;
+  const key = typeof ctx?.sessionKey === "string" ? ctx.sessionKey.trim().toLowerCase() : "";
+  const parts = key.split(":");
+  if (parts.length < 3 || parts[0] !== "agent") return false;
+  const rest = parts.slice(2);
+  if (rest.length === 1 && (rest[0] === "main" || rest[0].startsWith("ios-"))) return true;
+  if (rest.length === 2 && rest[0] === "dashboard") return true;
+  if (rest.length >= 3 && rest[1] === "direct") {
+    return SESSION_OWNERS.has(`${rest[0]}:${rest.slice(2).join(":")}`);
+  }
+  return false;
+}
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -639,6 +699,75 @@ mod tests {
         assert!(
             plugin.contains("let marker = findSettingsMarker(cwd);"),
             "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
+        );
+    }
+
+    #[test]
+    fn openclaw_every_hook_is_session_scoped() {
+        let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(plugin.contains("configureSessionScope((api as any).pluginConfig, (api as any).config);"));
+        let hooks = plugin.matches("api.on(\"").count();
+        let gated = plugin
+            .split("api.on(\"")
+            .skip(1)
+            .filter(|chunk| {
+                chunk
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|l| l.trim() == "if (!sessionInScope(ctx)) return;")
+            })
+            .count();
+        assert_eq!(hooks, 7, "{plugin}");
+        assert_eq!(gated, hooks, "every lifecycle hook must check the session scope first");
+        let manifest = manifest_json();
+        assert!(manifest.contains(r#""owner-direct""#), "{manifest}");
+    }
+
+    #[test]
+    fn openclaw_owner_direct_scope_keeps_groups_out() {
+        if !std::process::Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let module = tmp.path().join("scope.ts");
+        // (scope, sessionKey, memoryAudience kind, expected)
+        let cases = serde_json::json!([
+            ["all", "agent:main:whatsapp:group:120363000000000000@g.us", null, true],
+            ["owner-direct", "agent:main:whatsapp:group:120363000000000000@g.us", null, false],
+            ["owner-direct", "agent:main:discord:channel:1400000000000000000", null, false],
+            ["owner-direct", "agent:main:whatsapp:direct:+390000000001", null, true],
+            ["owner-direct", "agent:main:WhatsApp:direct:+390000000001", null, true],
+            ["owner-direct", "agent:main:whatsapp:direct:+390000000002", null, false],
+            ["owner-direct", "agent:main:discord:direct:900000000000000001", null, true],
+            ["owner-direct", "agent:main:telegram:direct:900000002", null, false],
+            ["owner-direct", "agent:main:main", null, true],
+            ["owner-direct", "agent:main:dashboard:0b3e1c52-2f7a-4a8e-9d8e-6e0c1f2a3b4c", null, true],
+            ["owner-direct", "agent:main:ios-0b3e1c52-2f7a-4a8e-9d8e-6e0c1f2a3b4c", null, true],
+            ["owner-direct", "agent:main:subagent:0b3e1c52-2f7a-4a8e-9d8e-6e0c1f2a3b4c", null, false],
+            ["owner-direct", "agent:main:subagent:0b3e1c52-2f7a-4a8e-9d8e-6e0c1f2a3b4c", "owner-private", true],
+            ["owner-direct", "agent:main:whatsapp:direct:+390000000001", "conversation", false],
+            ["owner-direct", "agent:main:cron:daily", null, false],
+            ["owner-direct", "", null, false],
+            ["owner-direct", null, null, false]
+        ]);
+        let source = format!(
+            "{SESSION_SCOPE_TS}\nconst cases = {cases};\nconst host = {{ commands: {{ ownerAllowFrom: [\"whatsapp:+390000000001\", \"discord:900000000000000001\"] }} }};\nconst bad: string[] = [];\nfor (const [scope, key, kind, want] of cases) {{\n  configureSessionScope({{ scope }}, host);\n  const ctx: any = {{ sessionKey: key }};\n  if (kind) ctx.memoryAudience = {{ kind }};\n  if (sessionInScope(ctx) !== want) bad.push(`${{scope}} ${{key}} ${{kind}} -> ${{!want}}`);\n}}\nconfigureSessionScope(undefined, host);\nif (!sessionInScope({{ sessionKey: \"agent:main:whatsapp:group:x\" }})) bad.push(\"missing config must keep upstream behaviour\");\nprocess.stdout.write(bad.join(\"\\n\"));\nprocess.exit(bad.length ? 1 : 0);\n"
+        );
+        std::fs::write(&module, source).unwrap();
+        let output = std::process::Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
